@@ -168,7 +168,7 @@ namespace kOS.Safe.Compilation
         /// </summary>
         private static Dictionary<object,int> argumentPackFinder;
         
-        private const string LABEL_INIT = "######"; // bogus value that is ensured to differ from any real value the first time through.
+        private const string LABEL_INIT = "@0000"; // bogus value that is ensured to differ from any real value the first time through.
 
         private static string previousLabel = LABEL_INIT;
 
@@ -242,7 +242,11 @@ namespace kOS.Safe.Compilation
             everything.AddRange(MagicId);
             everything.AddRange(headBuff);
             everything.AddRange(allCodeBuff);
-            everything.AddRange(lineMap.Pack());
+            //everything.AddRange(lineMap.Pack());
+            var debugLen = FewestBytesToHold(allCodeBuff.Count);
+            everything.AddRange(new List<byte> { (byte)'%', (byte)'D', (byte)debugLen, 0, 0, 1 });
+            everything.AddRange(Enumerable.Repeat<byte>(0, debugLen));
+            everything.AddRange(Enumerable.Repeat<byte>(0xff, debugLen));
             return everything.ToArray();
         }
         
@@ -266,6 +270,9 @@ namespace kOS.Safe.Compilation
                 IEnumerable<MLArgInfo> args = op.GetArgumentDefs();
                 foreach (MLArgInfo arg in args)
                 {
+                    if (arg.Type != MLFieldType.ArgumentRef)
+                        continue;
+
                     object argVal = arg.PropertyInfo.GetValue(op,null);
 
                     // Just trying to add the argument to the pack.  Don't
@@ -316,10 +323,34 @@ namespace kOS.Safe.Compilation
                 IEnumerable<MLArgInfo> args = op.GetArgumentDefs();
                 foreach (MLArgInfo arg in args)
                 {
-                    object argVal = arg.PropertyInfo.GetValue(op,null);
-                    int argPackedIndex = PackedArgumentLocation(argVal);
-                    byte[] argIndexEncoded = EncodeNumberToNBytes((ulong)argPackedIndex,argIndexSize);
-                    packTempWriter.Write(argIndexEncoded);
+                    object argVal = arg.PropertyInfo.GetValue(op, null);
+                    switch (arg.Type)
+                    {
+                        case MLFieldType.ArgumentRef:
+                            int argPackedIndex = PackedArgumentLocation(argVal);
+                            byte[] argIndexEncoded = EncodeNumberToNBytes((ulong)argPackedIndex, argIndexSize);
+                            packTempWriter.Write(argIndexEncoded);
+                            break;
+
+                        case MLFieldType.Byte:
+                            packTempWriter.Write(Convert.ToByte(argVal));
+                            break;
+
+                        case MLFieldType.SByte:
+                            packTempWriter.Write(Convert.ToSByte(argVal));
+                            break;
+
+                        case MLFieldType.UShort:
+                            packTempWriter.Write(Convert.ToUInt16(argVal));
+                            break;
+
+                        case MLFieldType.Short:
+                            packTempWriter.Write(Convert.ToInt16(argVal));
+                            break;
+
+                        default:
+                            throw new Exception("Can't pack unknown MLFieldType: " + arg.Type);
+                    }
                 }
                 
                 // Now add this range to the Debug line mapping for this source line:
@@ -699,20 +730,38 @@ namespace kOS.Safe.Compilation
                 var opArgs = new List<object>();
                 foreach (MLArgInfo argInfo in op.GetArgumentDefs())
                 {
-                    byte[] argPackIndex = reader.ReadBytes(argIndexSize);
-                    var argIndex = (int) DecodeNumberFromBytes(argPackIndex);
-                    object val;
-                    if (argInfo.NeedReindex)
-                    {                                              
-                        val = arguments[argIndex];
-                        if ( val is string && ((string)val).StartsWith("@") && (((string)val).Length > 1) )
-                        {
-                            val = "@" + prefix + "_" + ((string)val).Substring(1);
-                        }
-                    }
-                    else
+                    object val = null;
+                    switch (argInfo.Type)
                     {
-                        val = arguments[argIndex];
+                        case MLFieldType.ArgumentRef:
+                            byte[] argPackIndex = reader.ReadBytes(argIndexSize);
+                            var argIndex = (int)DecodeNumberFromBytes(argPackIndex);
+                            val = arguments[argIndex];
+                            break;
+
+                        case MLFieldType.Byte:
+                            val = reader.ReadByte();
+                            break;
+
+                        case MLFieldType.SByte:
+                            val = reader.ReadSByte();
+                            break;
+
+                        case MLFieldType.UShort:
+                            val = reader.ReadUInt16();
+                            break;
+
+                        case MLFieldType.Short:
+                            val = reader.ReadInt16();
+                            break;
+
+                        default:
+                            throw new Exception("Can't unpack unknown MLFieldType: " + argInfo.Type);
+                    }
+
+                    if (argInfo.NeedReindex && val is string && ((string)val).StartsWith("@") && (((string)val).Length > 1))
+                    {
+                        val = "@" + prefix + "_" + ((string)val).Substring(1);
                     }
                     opArgs.Add(val);
                 }

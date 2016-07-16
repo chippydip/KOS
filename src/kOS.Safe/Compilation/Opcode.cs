@@ -97,6 +97,15 @@ namespace kOS.Safe.Compilation
         LABELRESET = 0xf0     // for storing the fact that the Opcode.Label's positional index jumps weirdly.
     }
 
+    public enum MLFieldType
+    {
+        ArgumentRef,
+        Byte,
+        SByte,
+        UShort,
+        Short,
+    }
+
     /// <summary>
     /// Attach this attribute to all members of the opcode that are meant to be encoded into the packed
     /// byte-wise machine language version of this opcode:  There should be enough information
@@ -118,6 +127,7 @@ namespace kOS.Safe.Compilation
     {
         public int Ordering { get; private set; }
         public bool NeedReindex { get; private set;}
+        public MLFieldType Type { get; private set; }
         
         /// <summary>
         /// When constructing an MLField attribute, it's important
@@ -126,10 +136,12 @@ namespace kOS.Safe.Compilation
         /// </summary>
         /// <param name="sortNumber">Sort the MLField by the order of these numbers</param>
         /// <param name="needReindex">True if this is a numeric value that needs its value adjusted by the base code offset.</param>
-        public MLField(int sortNumber, bool needReindex)
+        /// <param name="type">Encoding method used for the field (defaults to a reference to the arguments section).</param>
+        public MLField(int sortNumber, bool needReindex, MLFieldType type = MLFieldType.ArgumentRef)
         {
             Ordering = sortNumber;
             NeedReindex = needReindex;
+            Type = type;
         }
     }
     
@@ -137,11 +149,13 @@ namespace kOS.Safe.Compilation
     {
         public PropertyInfo PropertyInfo {get; private set;}
         public bool NeedReindex {get; private set;}
+        public MLFieldType Type { get; private set; }
         
-        public MLArgInfo(PropertyInfo pInfo, bool needReindex)
+        public MLArgInfo(PropertyInfo pInfo, bool needReindex, MLFieldType type)
         {
             PropertyInfo = pInfo;
             NeedReindex = needReindex;
+            Type = type;
         }
     }
 
@@ -356,7 +370,7 @@ namespace kOS.Safe.Compilation
                                 var field = attrib as MLField;
                                 if (field == null) continue;
 
-                                argsInfo.Add(new MLArgInfo(pInfo, field.NeedReindex));
+                                argsInfo.Add(new MLArgInfo(pInfo, field.NeedReindex, field.Type));
                                 break;
                             }
                         }
@@ -940,7 +954,65 @@ namespace kOS.Safe.Compilation
             DeltaInstructionPointer = Distance;
         }
     }
-    
+
+    public abstract class BranchImmediateOpcode : Opcode
+    {
+        [MLField(0, true, MLFieldType.SByte)]
+        public sbyte Distance { get; set; }
+
+        public override void PopulateFromMLFields(List<object> fields)
+        {
+            // Expect fields in the same order as the [MLField] properties of this class:
+            if (fields == null || fields.Count < 1)
+                throw new Exception("Saved field in ML file for BranchImmediateOpcode seems to be missing.  Version mismatch?");
+            Distance = (sbyte)fields[0];
+        }
+
+        public override string ToString()
+        {
+            // Format string forces printing of '+/-' sign always, even for positive numbers.
+            // The intent is to make it more clear that this is a relative, not absolute jump:
+            return string.Format("{0} {1:+#;-#;+0}", Name, Distance);
+        }
+    }
+
+    public class OpcodeBranchIfFalseImmediate : BranchImmediateOpcode
+    {
+        protected override string Name { get { return "br.false.imm8"; } }
+        public override ByteCode Code { get { return (ByteCode)0x75; } }
+
+        public override void Execute(ICpu cpu)
+        {
+            bool condition = Convert.ToBoolean(cpu.PopValue());
+
+            DeltaInstructionPointer = !condition ? Distance : 1;
+        }
+    }
+
+    public class OpcodeBranchIfTrueImmediate : BranchImmediateOpcode
+    {
+        protected override string Name { get { return "br.true.imm8"; } }
+        public override ByteCode Code { get { return (ByteCode)0x76; } }
+
+        public override void Execute(ICpu cpu)
+        {
+            bool condition = Convert.ToBoolean(cpu.PopValue());
+            DeltaInstructionPointer = condition ? Distance : 1;
+        }
+    }
+
+
+    public class OpcodeBranchJumpImmediate : BranchImmediateOpcode
+    {
+        protected override string Name { get { return "jump.imm8"; } }
+        public override ByteCode Code { get { return (ByteCode)0x77; } }
+
+        public override void Execute(ICpu cpu)
+        {
+            DeltaInstructionPointer = Distance;
+        }
+    }
+
     /// <summary>
     /// Most Opcode.Label fields are just string-ified numbers for their index
     /// position.  But sometimes, when they are the entry point for a function
@@ -1520,6 +1592,52 @@ namespace kOS.Safe.Compilation
         }
     }
 
+    public class OpcodeCallDirect : Opcode
+    {
+        [MLField(1, true)]
+        public object Destination { get; set; }
+
+        protected override string Name { get { return "calld"; } }
+        public override ByteCode Code { get { return (ByteCode)0x72; } }
+
+        public OpcodeCallDirect(object destination)
+        {
+            Destination = destination;
+        }
+        /// <summary>
+        /// This variant of the constructor is just for machine language file read/write to use.
+        /// </summary>
+        protected OpcodeCallDirect() { }
+
+        public override void PopulateFromMLFields(List<object> fields)
+        {
+            // Expect fields in the same order as the [MLField] properties of this class:
+            if (fields == null || fields.Count < 1)
+                throw new Exception("Saved field in ML file for OpcodeCallDirect seems to be missing.  Version mismatch?");
+            Destination = fields[0];
+        }
+
+        public override void Execute(ICpu cpu)
+        {
+            int absoluteJumpTo = OpcodeCall.StaticExecute(cpu, true, Destination, false);
+            if (absoluteJumpTo >= 0)
+                DeltaInstructionPointer = absoluteJumpTo - cpu.InstructionPointer;
+        }
+    }
+
+    public class OpcodeCallIndirect : Opcode
+    {
+        protected override string Name { get { return "calli"; } }
+        public override ByteCode Code { get { return (ByteCode)0x73; } }
+
+        public override void Execute(ICpu cpu)
+        {
+            int absoluteJumpTo = OpcodeCall.StaticExecute(cpu, false, null, false);
+            if (absoluteJumpTo >= 0)
+                DeltaInstructionPointer = absoluteJumpTo - cpu.InstructionPointer;
+        }
+    }
+
     /// <summary>
     /// Returns from an OpcodeCall, popping a number of scope depths off
     /// the stack as it does so.  It evals the topmost thing on the stack.
@@ -1575,8 +1693,13 @@ namespace kOS.Safe.Compilation
         {
             Depth = depth;
         }
-        
+
         public override void Execute(ICpu cpu)
+        {
+            DeltaInstructionPointer = StaticExecute(cpu, Depth);
+        }
+
+        public static int StaticExecute(ICpu cpu, Int16 depth)
         {
             // Return value should be atop the stack.
             // Pop it, eval it, and push it back,
@@ -1604,8 +1727,8 @@ namespace kOS.Safe.Compilation
             cpu.PushStack(Structure.FromPrimitive(returnVal));
 
             // Now, after the eval was done, NOW finally pop the scope, after we don't need local vars anymore:
-            if( Depth > 0 )
-                OpcodePopScope.DoPopScope(cpu, Depth);
+            if( depth > 0 )
+                OpcodePopScope.DoPopScope(cpu, depth);
 
             // The only thing on the "above stack" now that is allowed to get in the way of
             // finding the context record that tells us where to jump back to, are the potential
@@ -1643,7 +1766,7 @@ namespace kOS.Safe.Compilation
             
             int destinationPointer = contextRecord.CameFromInstPtr;
             int currentPointer = cpu.InstructionPointer;
-            DeltaInstructionPointer = destinationPointer - currentPointer;
+            return destinationPointer - currentPointer;
         }
 
         public override string ToString()
@@ -1651,14 +1774,46 @@ namespace kOS.Safe.Compilation
             return String.Format("{0} {1} deep", Name, Depth);
         }
     }
+
+    public class OpcodeReturnImmediate : Opcode
+    {
+        protected override string Name { get { return "return.imm"; } }
+        public override ByteCode Code { get { return (ByteCode)0x78; } }
+
+        [MLField(0, true, MLFieldType.Byte)]
+        public byte Depth { get; private set; } // Determines how many levels to popscope.
+
+        public override void PopulateFromMLFields(List<object> fields)
+        {
+            // Expect fields in the same order as the [MLField] properties of this class:
+            if (fields == null || fields.Count < 1)
+                throw new Exception("Saved field in ML file for OpcodeReturnImmediate seems to be missing.  Version mismatch?");
+            Depth = (byte)fields[0];
+        }
+
+        // Default constructor is needed for PopulateFromMLFields but shouldn't be used outside the KSM file handler:
+        private OpcodeReturnImmediate()
+        {
+        }
+
+        public OpcodeReturnImmediate(byte depth)
+        {
+            Depth = depth;
+        }
+
+        public override void Execute(ICpu cpu)
+        {
+            DeltaInstructionPointer = OpcodeReturn.StaticExecute(cpu, Depth);
+        }
+    }
     #endregion
 
     #region Stack
-    
+
     public class OpcodePush : Opcode
     {
         [MLField(1,false)]
-        private object Argument { get; set; }
+        protected object Argument { get; set; }
 
         protected override string Name { get { return "push"; } }
         public override ByteCode Code { get { return ByteCode.PUSH; } }
@@ -1692,7 +1847,77 @@ namespace kOS.Safe.Compilation
             return Name + " " + argumentString;
         }
     }
-    
+
+    public class OpcodePushVar : OpcodePush
+    {
+        protected override string Name { get { return "push.var"; } }
+        public override ByteCode Code {  get { return (ByteCode)0x70; } }
+
+        public OpcodePushVar(string var)
+            : base(var)
+        {
+        }
+
+        /// <summary>
+        /// This variant of the constructor is just for ML file save/load to use.
+        /// </summary>
+        protected OpcodePushVar() { }
+
+        public override void Execute(ICpu cpu)
+        {
+            cpu.PushStack(Argument != null ? "$" + Argument : null);
+        }
+
+        public override string ToString()
+        {
+            string argumentString = Argument != null ? "$" + Argument : "null";
+            return Name + " " + argumentString;
+        }
+    }
+
+    public class OpcodePushFunc : OpcodePush
+    {
+        protected override string Name { get { return "push.func"; } }
+        public override ByteCode Code { get { return (ByteCode)0x71; } }
+
+        public OpcodePushFunc(string func)
+            : base(func)
+        {
+        }
+
+        /// <summary>
+        /// This variant of the constructor is just for ML file save/load to use.
+        /// </summary>
+        protected OpcodePushFunc() { }
+
+        public override void Execute(ICpu cpu)
+        {
+            cpu.PushStack(Argument != null ? "$" + Argument + "*" : null);
+        }
+
+        public override string ToString()
+        {
+            string argumentString = Argument != null ? "$" + Argument + "*" : "null";
+            return Name + " " + argumentString;
+        }
+    }
+
+    public class OpcodePushArgBottom : Opcode
+    {
+        protected override string Name { get { return "push.marker"; } }
+        public override ByteCode Code { get { return (ByteCode)0x74; } }
+
+        public override void Execute(ICpu cpu)
+        {
+            cpu.PushStack(new KOSArgMarkerType());
+        }
+
+        public override string ToString()
+        {
+            return Name + " _KOSArgMarkerType_";
+        }
+    }
+
     /// <summary>
     /// This class is an ugly placeholder to handle the fact that sometimes
     /// The compiler creates an OpcodePush that uses relocatable DestinationLabels as a
@@ -1758,7 +1983,78 @@ namespace kOS.Safe.Compilation
         }
     }
 
-    
+    public class OpcodePushRelocateLaterImmediate : Opcode
+    {
+        [MLField(0, true, MLFieldType.UShort)]
+        public ushort LabelNumber { get; set; }
+
+        protected override string Name { get { return "PushRelocateLaterImm"; } }
+        public override ByteCode Code { get { return (ByteCode)0x81; } }
+
+        public OpcodePushRelocateLaterImmediate(ushort labelNumber)
+        {
+            LabelNumber = labelNumber;
+            DestinationLabel = string.Format("@{0:0000}", labelNumber);
+        }
+
+        /// <summary>
+        /// This variant of the constructor is just for ML file save/load to use.
+        /// </summary>
+        protected OpcodePushRelocateLaterImmediate() { }
+
+        public override void PopulateFromMLFields(List<object> fields)
+        {
+            // Expect fields in the same order as the [MLField] properties of this class:
+            if (fields == null || fields.Count < 1)
+                throw new Exception("Saved field in ML file for OpcodePushRelocateLaterImmediate seems to be missing.  Version mismatch?");
+            LabelNumber = (ushort)fields[0];
+            DestinationLabel = string.Format("@{0:0000}", LabelNumber);
+        }
+
+        public override void Execute(ICpu cpu)
+        {
+            throw new InvalidOperationException("Attempt to execute OpcodePushRelocateLaterImmediate. This type of Opcode should have been replaced before execution.\n");
+        }
+
+        public override string ToString()
+        {
+            return Name + " Dest{" + DestinationLabel + "}";
+        }
+    }
+
+    public class OpcodePushDelegateCaptureRelocateLaterImmediate : OpcodePushRelocateLaterImmediate
+    {
+        protected override string Name { get { return "OpcodePushDelegateCaptureRelocateLaterImmediate"; } }
+        public override ByteCode Code { get { return (ByteCode)0x82; } }
+
+        public OpcodePushDelegateCaptureRelocateLaterImmediate(ushort labelNumber)
+            : base(labelNumber)
+        {
+        }
+
+        /// <summary>
+        /// This variant of the constructor is just for ML file save/load to use.
+        /// </summary>
+        protected OpcodePushDelegateCaptureRelocateLaterImmediate() { }
+    }
+
+    public class OpcodePushDelegateRelocateLaterImmediate : OpcodePushRelocateLaterImmediate
+    {
+        protected override string Name { get { return "OpcodePushDelegateRelocateLaterImmediate"; } }
+        public override ByteCode Code { get { return (ByteCode)0x83; } }
+
+        public OpcodePushDelegateRelocateLaterImmediate(ushort labelNumber)
+            : base(labelNumber)
+        {
+        }
+
+        /// <summary>
+        /// This variant of the constructor is just for ML file save/load to use.
+        /// </summary>
+        protected OpcodePushDelegateRelocateLaterImmediate() { }
+    }
+
+
     public class OpcodePop : Opcode
     {
         protected override string Name { get { return "pop"; } }
@@ -1948,7 +2244,56 @@ namespace kOS.Safe.Compilation
         {
             return String.Format("{0} {1} {2}", Name, ScopeId, ParentScopeId);
         }
-        
+    }
+
+    public class OpcodePushScopeImmediate : Opcode
+    {
+        [MLField(1, true, MLFieldType.Byte)]
+        public byte ScopeId { get; set; }
+        [MLField(2, true, MLFieldType.Byte)]
+        public byte ParentScopeId { get; set; }
+
+        /// <summary>
+        /// Push a scope frame that knows the id of its lexical parent scope.
+        /// </summary>
+        /// <param name="id">the unique id of this scope frame.</param>
+        /// <param name="parentId">the unique id of the scope frame this scope is inside of.</param>
+        public OpcodePushScopeImmediate(byte id, byte parentId)
+        {
+            ScopeId = id;
+            ParentScopeId = parentId;
+        }
+
+        /// <summary>
+        /// This variant of the constructor is just for ML file save/load to use.
+        /// </summary>
+        protected OpcodePushScopeImmediate()
+        {
+            ScopeId = 0xFF;
+            ParentScopeId = 0xFF;
+        }
+
+        public override void PopulateFromMLFields(List<object> fields)
+        {
+            // Expect fields in the same order as the [MLField] properties of this class:
+            if (fields == null || fields.Count < 2)
+                throw new Exception("Saved field in ML file for OpcodePushScopeImmediate seems to be missing.  Version mismatch?");
+            ScopeId = (byte)(fields[0]);
+            ParentScopeId = (byte)(fields[1]);
+        }
+
+        protected override string Name { get { return "pushscope.imm"; } }
+        public override ByteCode Code { get { return (ByteCode)0x79; } }
+
+        public override void Execute(ICpu cpu)
+        {
+            cpu.PushAboveStack(new VariableScope(ScopeId, ParentScopeId));
+        }
+
+        public override string ToString()
+        {
+            return String.Format("{0} {1} {2}", Name, ScopeId, ParentScopeId);
+        }
     }
 
     /// <summary>
@@ -2009,9 +2354,45 @@ namespace kOS.Safe.Compilation
         {
             return Name + " " + NumLevels;
         }
-        
     }
-    
+
+    public class OpcodePopScopeImmediate : Opcode
+    {
+        [MLField(1, true, MLFieldType.Byte)]
+        public byte NumLevels { get; set; }
+
+        protected override string Name { get { return "popscope.imm"; } }
+        public override ByteCode Code { get { return (ByteCode)0x80; } }
+
+        public OpcodePopScopeImmediate(byte numLevels)
+        {
+            NumLevels = numLevels;
+        }
+
+        public OpcodePopScopeImmediate()
+        {
+            NumLevels = 1;
+        }
+
+        public override void PopulateFromMLFields(List<object> fields)
+        {
+            // Expect fields in the same order as the [MLField] properties of this class:
+            if (fields == null || fields.Count < 1)
+                throw new Exception("Saved field in ML file for OpcodePopScopeImmediate seems to be missing.  Version mismatch?");
+            NumLevels = (byte)fields[0]; // should throw error if it's not an int.
+        }
+
+        public override void Execute(ICpu cpu)
+        {
+            OpcodePopScope.DoPopScope(cpu, NumLevels);
+        }
+
+        public override string ToString()
+        {
+            return Name + " " + NumLevels;
+        }
+    }
+
     public class OpcodePushDelegate : Opcode
     {
         [MLField(1,false)]
